@@ -534,8 +534,24 @@ class GCENodeDriver(NodeDriver):
         "TERMINATED": NodeState.TERMINATED
     }
 
-    def __init__(self, user_id, key, datacenter=None, project=None,
-                 auth_type=None, scopes=None, **kwargs):
+    AUTH_URL = "https://www.googleapis.com/auth/"
+    SA_SCOPES_MAP = {
+        # list derived from 'gcloud compute instances create --help'
+        "bigquery": "bigquery",
+        "compute-ro": "compute.readonly",
+        "compute-rw": "compute",
+        "datastore": "datastore",
+        "sql": "sqlservice",
+        "sql-admin": "sqlservice.admin",
+        "storage-full": "devstorage.full_control",
+        "storage-ro": "devstorage.read_only",
+        "storage-rw": "devstorage.read_write",
+        "taskqueue": "taskqueue",
+        "userinfo-email": "userinfo.email"
+    }
+
+    def __init__(self, user_id, key=None, datacenter=None, project=None,
+                 auth_type=None, scopes=None, credential_file=None, **kwargs):
         """
         :param  user_id: The email address (for service accounts) or Client ID
                          (for installed apps) to be used for authentication.
@@ -553,22 +569,33 @@ class GCENodeDriver(NodeDriver):
         :keyword  project: Your GCE project name. (required)
         :type     project: ``str``
 
-        :keyword  auth_type: Accepted values are "SA" or "IA"
-                             ("Service Account" or "Installed Application").
+        :keyword  auth_type: Accepted values are "SA" or "IA" or "GCE"
+                             ("Service Account" or "Installed Application" or
+                             "GCE" if libcloud is being used on a GCE instance
+                             with service account enabled).
                              If not supplied, auth_type will be guessed based
-                             on value of user_id.
+                             on value of user_id or if the code is being
+                             executed in a GCE instance.
         :type     auth_type: ``str``
 
         :keyword  scopes: List of authorization URLs. Default is empty and
                           grants read/write to Compute, Storage, DNS.
         :type     scopes: ``list``
+
+        :keyword  credential_file: Path to file for caching authentication
+                                   information used by GCEConnection.
+        :type     credential_file: ``str``
         """
+        if not project:
+            raise ValueError('Project name must be specified using '
+                             '"project" keyword.')
+
         self.auth_type = auth_type
         self.project = project
         self.scopes = scopes
-        if not self.project:
-            raise ValueError('Project name must be specified using '
-                             '"project" keyword.')
+        self.credential_file = credential_file or \
+            '~/.gce_libcloud_auth' + '.' + self.project
+
         super(GCENodeDriver, self).__init__(user_id, key, **kwargs)
 
         # Cache Zone and Region information to reduce API calls and
@@ -910,7 +937,7 @@ class GCENodeDriver(NodeDriver):
         list_zones = [self._to_zone(z) for z in response['items']]
         return list_zones
 
-    def ex_create_address(self, name, region=None):
+    def ex_create_address(self, name, region=None, address=None):
         """
         Create a static address in a region.
 
@@ -919,6 +946,10 @@ class GCENodeDriver(NodeDriver):
 
         :keyword  region: Name of region for the address (e.g. 'us-central1')
         :type     region: ``str`` or :class:`GCERegion`
+
+        :keyword  address: Ephemeral IP address to promote to a static one
+                           (e.g. 'xxx.xxx.xxx.xxx')
+        :type     address: ``str`` or ``None``
 
         :return:  Static Address object
         :rtype:   :class:`GCEAddress`
@@ -930,6 +961,8 @@ class GCENodeDriver(NodeDriver):
             raise ValueError('REGION_NOT_SPECIFIED',
                              'Region must be provided for an address')
         address_data = {'name': name}
+        if address:
+            address_data['address'] = address
         request = '/regions/%s/addresses' % (region.name)
         self.connection.async_request(request, method='POST',
                                       data=address_data)
@@ -938,7 +971,8 @@ class GCENodeDriver(NodeDriver):
     def ex_create_healthcheck(self, name, host=None, path=None, port=None,
                               interval=None, timeout=None,
                               unhealthy_threshold=None,
-                              healthy_threshold=None):
+                              healthy_threshold=None,
+                              description=None):
         """
         Create an Http Health Check.
 
@@ -969,6 +1003,9 @@ class GCENodeDriver(NodeDriver):
                                      healthy.  Defaults to 2.
         :type     healthy_threshold: ``int``
 
+        :keyword  description: The description of the check.  Defaults to None.
+        :type     description: ``str`` or ``None``
+
         :return:  Health Check object
         :rtype:   :class:`GCEHealthCheck`
         """
@@ -976,6 +1013,8 @@ class GCENodeDriver(NodeDriver):
         hc_data['name'] = name
         if host:
             hc_data['host'] = host
+        if description:
+            hc_data['description'] = description
         # As of right now, the 'default' values aren't getting set when called
         # through the API, so set them explicitly
         hc_data['requestPath'] = path or '/'
@@ -1046,7 +1085,9 @@ class GCENodeDriver(NodeDriver):
         firewall_data['name'] = name
         firewall_data['allowed'] = allowed
         firewall_data['network'] = nw.extra['selfLink']
-        firewall_data['sourceRanges'] = source_ranges or ['0.0.0.0/0']
+        if source_ranges is None:
+            source_ranges = ['0.0.0.0/0']
+        firewall_data['sourceRanges'] = source_ranges
         if source_tags is not None:
             firewall_data['sourceTags'] = source_tags
         if target_tags is not None:
@@ -1060,7 +1101,7 @@ class GCENodeDriver(NodeDriver):
 
     def ex_create_forwarding_rule(self, name, targetpool, region=None,
                                   protocol='tcp', port_range=None,
-                                  address=None):
+                                  address=None, description=None):
         """
         Create a forwarding rule.
 
@@ -1085,6 +1126,10 @@ class GCENodeDriver(NodeDriver):
                            in same region.
         :type     address: ``str`` or :class:`GCEAddress`
 
+        :keyword  description: The description of the forwarding rule.
+                               Defaults to None.
+        :type     description: ``str`` or ``None``
+
         :return:  Forwarding Rule object
         :rtype:   :class:`GCEForwardingRule`
         """
@@ -1098,13 +1143,15 @@ class GCENodeDriver(NodeDriver):
         forwarding_rule_data['name'] = name
         forwarding_rule_data['region'] = region.extra['selfLink']
         forwarding_rule_data['target'] = targetpool.extra['selfLink']
-        forwarding_rule_data['protocol'] = protocol.upper()
+        forwarding_rule_data['IPProtocol'] = protocol.upper()
         if address:
             if not hasattr(address, 'name'):
                 address = self.ex_get_address(address, region)
-            forwarding_rule_data['IPAddress'] = address.extra['selfLink']
+            forwarding_rule_data['IPAddress'] = address.address
         if port_range:
             forwarding_rule_data['portRange'] = port_range
+        if description:
+            forwarding_rule_data['description'] = description
 
         request = '/regions/%s/forwardingRules' % (region.name)
 
@@ -1112,6 +1159,67 @@ class GCENodeDriver(NodeDriver):
                                       data=forwarding_rule_data)
 
         return self.ex_get_forwarding_rule(name)
+
+    def ex_create_image(self, name, volume, description=None,
+                        use_existing=True, wait_for_completion=True):
+        """
+        Create an image from the provided volume.
+
+        :param  name: The name of the image to create.
+        :type   name: ``str``
+
+        :param  volume: The volume to use to create the image, or the
+                        Google Cloud Storage URI
+        :type   volume: ``str`` or :class:`StorageVolume`
+
+        :keyword    description: Description of the new Image
+        :type       description: ``str``
+
+        :keyword  use_existing: If True and an image with the given name
+                                already exists, return an object for that
+                                image instead of attempting to create
+                                a new image.
+        :type     use_existing: ``bool``
+
+        :keyword  wait_for_completion: If True, wait until the new image is
+                                       created before returning a new NodeImage
+                                       Otherwise, return a new NodeImage
+                                       instance, and let the user track the
+                                       creation progress
+        :type     wait_for_completion: ``bool``
+
+        :return:    A GCENodeImage object for the new image
+        :rtype:     :class:`GCENodeImage`
+
+        """
+        image_data = {}
+        image_data['name'] = name
+        image_data['description'] = description
+        if isinstance(volume, StorageVolume):
+            image_data['sourceDisk'] = volume.extra['selfLink']
+            image_data['zone'] = volume.extra['zone'].name
+        elif isinstance(volume, str) and \
+                volume.startswith('https://') and volume.endswith('tar.gz'):
+            image_data['rawDisk'] = {'source': volume, 'containerType': 'TAR'}
+        else:
+            raise ValueError('Source must be instance of StorageVolume or URI')
+
+        request = '/global/images'
+
+        try:
+            if wait_for_completion:
+                self.connection.async_request(request, method='POST',
+                                              data=image_data)
+            else:
+                self.connection.request(request, method='POST',
+                                        data=image_data)
+
+        except ResourceExistsError:
+            e = sys.exc_info()[1]
+            if not use_existing:
+                raise e
+
+        return self.ex_get_image(name)
 
     def ex_create_network(self, name, cidr):
         """
@@ -1141,7 +1249,7 @@ class GCENodeDriver(NodeDriver):
                     ex_network='default', ex_tags=None, ex_metadata=None,
                     ex_boot_disk=None, use_existing_disk=True,
                     external_ip='ephemeral', ex_disk_type='pd-standard',
-                    ex_disk_auto_delete=True):
+                    ex_disk_auto_delete=True, ex_service_accounts=None):
         """
         Create a new node and return a node object for the node.
 
@@ -1192,6 +1300,20 @@ class GCENodeDriver(NodeDriver):
                                        True by default.
         :type     ex_disk_auto_delete: ``bool``
 
+        :keyword  ex_service_accounts: Specify a list of serviceAccounts when
+                                       creating the instance. The format is a
+                                       list of dictionaries containing email
+                                       and list of scopes, e.g.
+                                       [{'email':'default',
+                                         'scopes':['compute', ...]}, ...]
+                                       Scopes can either be full URLs or short
+                                       names. If not provided, use the
+                                       'default' service account email and a
+                                       scope of 'devstorage.read_only'. Also
+                                       accepts the aliases defined in
+                                       'gcloud cmopute'.
+        :type     ex_service_accounts: ``list``
+
         :return:  A Node object for the new node.
         :rtype:   :class:`Node`
         """
@@ -1211,16 +1333,31 @@ class GCENodeDriver(NodeDriver):
                                               use_existing=use_existing_disk,
                                               ex_disk_type=ex_disk_type)
 
-        if ex_metadata is not None:
-            ex_metadata = {"items": [{"key": k, "value": v}
-                                     for k, v in ex_metadata.items()]}
+        if not ex_metadata:
+            ex_metadata = None
+        elif not isinstance(ex_metadata, dict):
+            raise ValueError('metadata field is not a dictionnary.')
+        else:
+            if 'items' not in ex_metadata:
+                # The expected GCE format is odd:
+                # items: [{'value': '1', 'key': 'one'},
+                #        {'value': '2', 'key': 'two'},
+                #        {'value': 'N', 'key': 'N'}]
+                # So the only real key is items, and the values are tuples
+                # Since arbitrary values are fine, we only check for the key.
+                # If missing, we prefix it to the items.
+                items = []
+                for k, v in ex_metadata.items():
+                    items.append({'key': k, 'value': v})
+                ex_metadata = {'items': items}
 
         request, node_data = self._create_node_req(name, size, image,
                                                    location, ex_network,
                                                    ex_tags, ex_metadata,
                                                    ex_boot_disk, external_ip,
                                                    ex_disk_type,
-                                                   ex_disk_auto_delete)
+                                                   ex_disk_auto_delete,
+                                                   ex_service_accounts)
         self.connection.async_request(request, method='POST', data=node_data)
 
         return self.ex_get_node(name, location.name)
@@ -1232,6 +1369,7 @@ class GCENodeDriver(NodeDriver):
                                  poll_interval=2, external_ip='ephemeral',
                                  ex_disk_type='pd-standard',
                                  ex_auto_disk_delete=True,
+                                 ex_service_accounts=None,
                                  timeout=DEFAULT_TASK_COMPLETION_TIMEOUT):
         """
         Create multiple nodes and return a list of Node objects.
@@ -1297,6 +1435,20 @@ class GCENodeDriver(NodeDriver):
                                        True by default.
         :type     ex_disk_auto_delete: ``bool``
 
+        :keyword  ex_service_accounts: Specify a list of serviceAccounts when
+                                       creating the instance. The format is a
+                                       list of dictionaries containing email
+                                       and list of scopes, e.g.
+                                       [{'email':'default',
+                                         'scopes':['compute', ...]}, ...]
+                                       Scopes can either be full URLs or short
+                                       names. If not provided, use the
+                                       'default' service account email and a
+                                       scope of 'devstorage.read_only'. Also
+                                       accepts the aliases defined in
+                                       'gcloud cmopute'.
+        :type     ex_service_accounts: ``list``
+
         :keyword  timeout: The number of seconds to wait for all nodes to be
                            created before timing out.
         :type     timeout: ``int``
@@ -1323,7 +1475,8 @@ class GCENodeDriver(NodeDriver):
                       'ignore_errors': ignore_errors,
                       'use_existing_disk': use_existing_disk,
                       'external_ip': external_ip,
-                      'ex_disk_type': ex_disk_type}
+                      'ex_disk_type': ex_disk_type,
+                      'ex_service_accounts': ex_service_accounts}
 
         # List for holding the status information for disk/node creation.
         status_list = []
@@ -1599,16 +1752,25 @@ class GCENodeDriver(NodeDriver):
         """
         if not hasattr(targetpool, 'name'):
             targetpool = self.ex_get_targetpool(targetpool)
-        if not hasattr(node, 'name'):
-            node = self.ex_get_node(node, 'all')
+        if hasattr(node, 'name'):
+            node_uri = node.extra['selfLink']
+        else:
+            if node.startswith('https://'):
+                node_uri = node
+            else:
+                node = self.ex_get_node(node, 'all')
+                node_uri = node.extra['selfLink']
 
-        targetpool_data = {'instances': [{'instance': node.extra['selfLink']}]}
+        targetpool_data = {'instances': [{'instance': node_uri}]}
 
         request = '/regions/%s/targetPools/%s/addInstance' % (
             targetpool.region.name, targetpool.name)
         self.connection.async_request(request, method='POST',
                                       data=targetpool_data)
-        targetpool.nodes.append(node)
+        if all((node_uri != n) and
+               (not hasattr(n, 'extra') or n.extra['selfLink'] != node_uri)
+               for n in targetpool.nodes):
+            targetpool.nodes.append(node)
         return True
 
     def ex_targetpool_add_healthcheck(self, targetpool, healthcheck):
@@ -1629,7 +1791,9 @@ class GCENodeDriver(NodeDriver):
         if not hasattr(healthcheck, 'name'):
             healthcheck = self.ex_get_healthcheck(healthcheck)
 
-        targetpool_data = {'healthCheck': healthcheck.extra['selfLink']}
+        targetpool_data = {
+            'healthChecks': [{'healthCheck': healthcheck.extra['selfLink']}]
+        }
 
         request = '/regions/%s/targetPools/%s/addHealthCheck' % (
             targetpool.region.name, targetpool.name)
@@ -1653,10 +1817,17 @@ class GCENodeDriver(NodeDriver):
         """
         if not hasattr(targetpool, 'name'):
             targetpool = self.ex_get_targetpool(targetpool)
-        if not hasattr(node, 'name'):
-            node = self.ex_get_node(node, 'all')
 
-        targetpool_data = {'instances': [{'instance': node.extra['selfLink']}]}
+        if hasattr(node, 'name'):
+            node_uri = node.extra['selfLink']
+        else:
+            if node.startswith('https://'):
+                node_uri = node
+            else:
+                node = self.ex_get_node(node, 'all')
+                node_uri = node.extra['selfLink']
+
+        targetpool_data = {'instances': [{'instance': node_uri}]}
 
         request = '/regions/%s/targetPools/%s/removeInstance' % (
             targetpool.region.name, targetpool.name)
@@ -1665,7 +1836,8 @@ class GCENodeDriver(NodeDriver):
         # Remove node object from node list
         index = None
         for i, nd in enumerate(targetpool.nodes):
-            if nd.name == node.name:
+            if nd == node_uri or (hasattr(nd, 'extra') and
+                                  nd.extra['selfLink'] == node_uri):
                 index = i
                 break
         if index is not None:
@@ -1690,7 +1862,9 @@ class GCENodeDriver(NodeDriver):
         if not hasattr(healthcheck, 'name'):
             healthcheck = self.ex_get_healthcheck(healthcheck)
 
-        targetpool_data = {'healthCheck': healthcheck.extra['selfLink']}
+        targetpool_data = {
+            'healthChecks': [{'healthCheck': healthcheck.extra['selfLink']}]
+        }
 
         request = '/regions/%s/targetPools/%s/removeHealthCheck' % (
             targetpool.region.name, targetpool.name)
@@ -1814,7 +1988,8 @@ class GCENodeDriver(NodeDriver):
         return success
 
     def deploy_node(self, name, size, image, script, location=None,
-                    ex_network='default', ex_tags=None):
+                    ex_network='default', ex_tags=None,
+                    ex_service_accounts=None):
         """
         Create a new node and run a script on start-up.
 
@@ -1840,6 +2015,20 @@ class GCENodeDriver(NodeDriver):
         :keyword  ex_tags: A list of tags to associate with the node.
         :type     ex_tags: ``list`` of ``str`` or ``None``
 
+        :keyword  ex_service_accounts: Specify a list of serviceAccounts when
+                                       creating the instance. The format is a
+                                       list of dictionaries containing email
+                                       and list of scopes, e.g.
+                                       [{'email':'default',
+                                         'scopes':['compute', ...]}, ...]
+                                       Scopes can either be full URLs or short
+                                       names. If not provided, use the
+                                       'default' service account email and a
+                                       scope of 'devstorage.read_only'. Also
+                                       accepts the aliases defined in
+                                       'gcloud cmopute'.
+        :type     ex_service_accounts: ``list``
+
         :return:  A Node object for the new node.
         :rtype:   :class:`Node`
         """
@@ -1850,7 +2039,8 @@ class GCENodeDriver(NodeDriver):
 
         return self.create_node(name, size, image, location=location,
                                 ex_network=ex_network, ex_tags=ex_tags,
-                                ex_metadata=metadata)
+                                ex_metadata=metadata,
+                                ex_service_accounts=ex_service_accounts)
 
     def attach_volume(self, node, volume, device=None, ex_mode=None,
                       ex_boot=False):
@@ -2570,7 +2760,8 @@ class GCENodeDriver(NodeDriver):
     def _ex_connection_class_kwargs(self):
         return {'auth_type': self.auth_type,
                 'project': self.project,
-                'scopes': self.scopes}
+                'scopes': self.scopes,
+                'credential_file': self.credential_file}
 
     def _catch_error(self, ignore_errors=False):
         """
@@ -2747,7 +2938,7 @@ class GCENodeDriver(NodeDriver):
     def _create_node_req(self, name, size, image, location, network,
                          tags=None, metadata=None, boot_disk=None,
                          external_ip='ephemeral', ex_disk_type='pd-standard',
-                         ex_disk_auto_delete=True):
+                         ex_disk_auto_delete=True, ex_service_accounts=None):
         """
         Returns a request and body to create a new node.  This is a helper
         method to support both :class:`create_node` and
@@ -2794,6 +2985,20 @@ class GCENodeDriver(NodeDriver):
                                        True by default.
         :type     ex_disk_auto_delete: ``bool``
 
+        :keyword  ex_service_accounts: Specify a list of serviceAccounts when
+                                       creating the instance. The format is a
+                                       list of dictionaries containing email
+                                       and list of scopes, e.g.
+                                       [{'email':'default',
+                                         'scopes':['compute', ...]}, ...]
+                                       Scopes can either be full URLs or short
+                                       names. If not provided, use the
+                                       'default' service account email and a
+                                       scope of 'devstorage.read_only'. Also
+                                       accepts the aliases defined in
+                                       'gcloud cmopute'.
+        :type     ex_service_accounts: ``list``
+
         :return:  A tuple containing a request string and a node_data dict.
         :rtype:   ``tuple`` of ``str`` and ``dict``
         """
@@ -2804,6 +3009,38 @@ class GCENodeDriver(NodeDriver):
             node_data['tags'] = {'items': tags}
         if metadata:
             node_data['metadata'] = metadata
+
+        # by default, new instances will match the same serviceAccount and
+        # scope set in the Developers Console and Cloud SDK
+        if not ex_service_accounts:
+            set_scopes = [{
+                'email': 'default',
+                'scopes': [self.AUTH_URL + 'devstorage.read_only']
+            }]
+        elif not isinstance(ex_service_accounts, list):
+            raise ValueError("ex_service_accounts field is not a list.")
+        else:
+            set_scopes = []
+            for sa in ex_service_accounts:
+                if not isinstance(sa, dict):
+                    raise ValueError("ex_service_accounts needs to be a list "
+                                     "of dicts, got: '%s - %s'" % (
+                                         str(type(sa)), str(sa)))
+                if 'email' not in sa:
+                    sa['email'] = 'default'
+                if 'scopes' not in sa:
+                    sa['scopes'] = [self.AUTH_URL + 'devstorage.read_only']
+                ps = []
+                for scope in sa['scopes']:
+                    if scope.startswith(self.AUTH_URL):
+                        ps.append(scope)
+                    elif scope in self.SA_SCOPES_MAP:
+                        ps.append(self.AUTH_URL + self.SA_SCOPES_MAP[scope])
+                    else:
+                        ps.append(self.AUTH_URL + scope)
+                sa['scopes'] = ps
+                set_scopes.append(sa)
+        node_data['serviceAccounts'] = set_scopes
 
         if boot_disk:
             disks = [{'kind': 'compute#attachedDisk',
@@ -2924,7 +3161,8 @@ class GCENodeDriver(NodeDriver):
             status['name'], node_attrs['size'], node_attrs['image'],
             node_attrs['location'], node_attrs['network'], node_attrs['tags'],
             node_attrs['metadata'], boot_disk=status['disk'],
-            external_ip=node_attrs['external_ip'])
+            external_ip=node_attrs['external_ip'],
+            ex_service_accounts=node_attrs['ex_service_accounts'])
         try:
             node_res = self.connection.request(
                 request, method='POST', data=node_data).object

@@ -39,7 +39,7 @@ from libcloud.common.openstack import OpenStackBaseConnection
 from libcloud.common.openstack import OpenStackDriverMixin
 from libcloud.common.openstack import OpenStackException
 from libcloud.common.openstack import OpenStackResponse
-from libcloud.utils.networking import is_private_subnet
+from libcloud.utils.networking import is_public_subnet
 from libcloud.compute.base import NodeSize, NodeImage
 from libcloud.compute.base import (NodeDriver, Node, NodeLocation,
                                    StorageVolume, VolumeSnapshot)
@@ -86,7 +86,8 @@ class OpenStackNodeDriver(NodeDriver, OpenStackDriverMixin):
         'BUILD': NodeState.PENDING,
         'REBUILD': NodeState.PENDING,
         'ACTIVE': NodeState.RUNNING,
-        'SUSPENDED': NodeState.TERMINATED,
+        'SUSPENDED': NodeState.STOPPED,
+        'SHUTOFF': NodeState.STOPPED,
         'DELETED': NodeState.TERMINATED,
         'QUEUE_RESIZE': NodeState.PENDING,
         'PREP_RESIZE': NodeState.PENDING,
@@ -98,6 +99,7 @@ class OpenStackNodeDriver(NodeDriver, OpenStackDriverMixin):
         'SHARE_IP': NodeState.PENDING,
         'SHARE_IP_NO_CONFIG': NodeState.PENDING,
         'DELETE_IP': NodeState.PENDING,
+        'ERROR': NodeState.ERROR,
         'UNKNOWN': NodeState.UNKNOWN
     }
 
@@ -150,7 +152,7 @@ class OpenStackNodeDriver(NodeDriver, OpenStackDriverMixin):
         if snapshot:
             raise NotImplementedError(
                 "create_volume does not yet support create from snapshot")
-        return self.connection.request('/os-volumes',
+        resp = self.connection.request('/os-volumes',
                                        method='POST',
                                        data={
                                            'volume': {
@@ -163,7 +165,8 @@ class OpenStackNodeDriver(NodeDriver, OpenStackDriverMixin):
                                                },
                                                'availability_zone': location,
                                            }
-                                       }).success()
+                                       })
+        return self._to_volume(resp.object)
 
     def destroy_volume(self, volume):
         return self.connection.request('/os-volumes/%s' % volume.id,
@@ -1166,11 +1169,15 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
 
 
         :keyword    networks: The server is launched into a set of Networks.
-        :type       networks: :class:`OpenStackNetwork`
+        :type       networks: ``list`` of :class:`OpenStackNetwork`
 
         :keyword    ex_disk_config: Name of the disk configuration.
                                     Can be either ``AUTO`` or ``MANUAL``.
         :type       ex_disk_config: ``str``
+
+        :keyword    ex_config_drive: If True enables metadata injection in a
+                                     server through a configuration drive.
+        :type       ex_config_drive: ``bool``
 
         :keyword    ex_admin_pass: The root password for the node
         :type       ex_admin_pass: ``str``
@@ -1260,6 +1267,9 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
 
         if 'ex_disk_config' in kwargs:
             server_params['OS-DCF:diskConfig'] = kwargs['ex_disk_config']
+
+        if 'ex_config_drive' in kwargs:
+            server_params['config_drive'] = str(kwargs['ex_config_drive'])
 
         if 'ex_admin_pass' in kwargs:
             server_params['adminPass'] = kwargs['ex_admin_pass']
@@ -1354,6 +1364,10 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
         :keyword    ex_disk_config: Name of the disk configuration.
                                     Can be either ``AUTO`` or ``MANUAL``.
         :type       ex_disk_config: ``str``
+
+        :keyword    ex_config_drive: If True enables metadata injection in a
+                                     server through a configuration drive.
+        :type       ex_config_drive: ``bool``
 
         :rtype: ``bool``
         """
@@ -1940,25 +1954,46 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
         public_ips, private_ips = [], []
 
         for label, values in api_node['addresses'].items():
-            ips = [v['addr'] for v in values]
+            for value in values:
+                ip = value['addr']
 
-            if label in public_networks_labels:
-                public_ips.extend(ips)
-            else:
-                for ip in ips:
-                    # is_private_subnet does not check for ipv6
-                    try:
-                        if is_private_subnet(ip):
-                            private_ips.append(ip)
-                        else:
-                            public_ips.append(ip)
-                    except:
-                        private_ips.append(ip)
+                is_public_ip = False
+
+                try:
+                    public_subnet = is_public_subnet(ip)
+                except:
+                    # IPv6
+                    public_subnet = False
+
+                # Openstack Icehouse sets 'OS-EXT-IPS:type' to 'floating' for
+                # public and 'fixed' for private
+                explicit_ip_type = value.get('OS-EXT-IPS:type', None)
+
+                if explicit_ip_type == 'floating':
+                    is_public_ip = True
+                elif explicit_ip_type == 'fixed':
+                    is_public_ip = False
+                elif label in public_networks_labels:
+                    # Try label next
+                    is_public_ip = True
+                elif public_subnet:
+                    # Check for public subnet
+                    is_public_ip = True
+
+                if is_public_ip:
+                    public_ips.append(ip)
+                else:
+                    private_ips.append(ip)
 
         # Sometimes 'image' attribute is not present if the node is in an error
         # state
         image = api_node.get('image', None)
         image_id = image.get('id', None) if image else None
+
+        if api_node.get("config_drive", False).lower() == "true":
+            config_drive = True
+        else:
+            config_drive = False
 
         return Node(
             id=api_node['id'],
@@ -1984,6 +2019,7 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
                 updated=api_node['updated'],
                 key_name=api_node.get('key_name', None),
                 disk_config=api_node.get('OS-DCF:diskConfig', None),
+                config_drive=config_drive,
                 availability_zone=api_node.get('OS-EXT-AZ:availability_zone',
                                                None),
             ),
@@ -2000,6 +2036,11 @@ class OpenStack_1_1_NodeDriver(OpenStackNodeDriver):
             extra={
                 'description': api_node['displayDescription'],
                 'attachments': [att for att in api_node['attachments'] if att],
+                'state': api_node.get('status', None),
+                'location': api_node.get('availabilityZone', None),
+                'volume_type': api_node.get('volumeType', None),
+                'metadata': api_node.get('metadata', None),
+                'created_at': api_node.get('createdAt', None)
             }
         )
 

@@ -56,8 +56,14 @@ class BaseEC2Tests(LibcloudTestCase):
         regions = REGION_DETAILS.keys()
         regions = [d for d in regions if d != 'nimbus']
 
-        for region in regions:
-            EC2NodeDriver(*EC2_PARAMS, **{'region': region})
+        region_endpoints = [
+            EC2NodeDriver(*EC2_PARAMS, **{'region': region}).connection.host for region in regions
+        ]
+
+        # Verify that each driver doesn't get the same API host endpoint
+        self.assertEqual(len(region_endpoints),
+                         len(set(region_endpoints)),
+                         "Multiple Region Drivers were given the same API endpoint")
 
     def test_instantiate_driver_invalid_regions(self):
         for region in ['invalid', 'nimbus']:
@@ -373,7 +379,7 @@ class EC2Tests(LibcloudTestCase, TestCaseMixin):
             self.assertTrue('m2.4xlarge' in ids)
 
             if region_name == 'us-east-1':
-                self.assertEqual(len(sizes), 33)
+                self.assertEqual(len(sizes), 36)
                 self.assertTrue('cg1.4xlarge' in ids)
                 self.assertTrue('cc2.8xlarge' in ids)
                 self.assertTrue('cr1.8xlarge' in ids)
@@ -382,11 +388,11 @@ class EC2Tests(LibcloudTestCase, TestCaseMixin):
             if region_name == 'us-west-2':
                 self.assertEqual(len(sizes), 29)
             elif region_name == 'ap-southeast-1':
-                self.assertEqual(len(sizes), 24)
+                self.assertEqual(len(sizes), 27)
             elif region_name == 'ap-southeast-2':
-                self.assertEqual(len(sizes), 29)
+                self.assertEqual(len(sizes), 32)
             elif region_name == 'eu-west-1':
-                self.assertEqual(len(sizes), 31)
+                self.assertEqual(len(sizes), 34)
 
         self.driver.region_name = region_old
 

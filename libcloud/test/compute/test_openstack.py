@@ -750,14 +750,24 @@ class OpenStack_1_1_Tests(unittest.TestCase, TestCaseMixin):
         node = nodes[0]
 
         self.assertEqual('12065', node.id)
+
         # test public IPv4
         self.assertTrue('12.16.18.28' in node.public_ips)
         self.assertTrue('50.57.94.35' in node.public_ips)
+
+        # floating ip
+        self.assertTrue('192.168.3.3' in node.public_ips)
+
         # test public IPv6
         self.assertTrue(
             '2001:4801:7808:52:16:3eff:fe47:788a' in node.public_ips)
+
         # test private IPv4
         self.assertTrue('10.182.64.34' in node.private_ips)
+
+        # floating ip
+        self.assertTrue('10.3.3.3' in node.private_ips)
+
         # test private IPv6
         self.assertTrue(
             'fec0:4801:7808:52:16:3eff:fe60:187d' in node.private_ips)
@@ -784,18 +794,34 @@ class OpenStack_1_1_Tests(unittest.TestCase, TestCaseMixin):
         self.assertEqual('cd76a3a1-c4ce-40f6-9b9f-07a61508938d', volume.id)
         self.assertEqual('test_volume_2', volume.name)
         self.assertEqual(2, volume.size)
-
-        self.assertEqual(volume.extra['description'], '')
-        self.assertEqual(volume.extra['attachments'][0][
-                         'id'], 'cd76a3a1-c4ce-40f6-9b9f-07a61508938d')
+        self.assertEqual(volume.extra, {
+            'description': '',
+            'attachments': [{
+                'id': 'cd76a3a1-c4ce-40f6-9b9f-07a61508938d',
+                "device": "/dev/vdb",
+                "serverId": "12065",
+                "volumeId": "cd76a3a1-c4ce-40f6-9b9f-07a61508938d",
+            }],
+            'state': 'available',
+            'location': 'nova',
+            'volume_type': 'None',
+            'metadata': {},
+            'created_at': '2013-06-24T11:20:13.000000',
+        })
 
         volume = volumes[1]
         self.assertEqual('cfcec3bc-b736-4db5-9535-4c24112691b5', volume.id)
         self.assertEqual('test_volume', volume.name)
         self.assertEqual(50, volume.size)
-
-        self.assertEqual(volume.extra['description'], 'some description')
-        self.assertEqual(volume.extra['attachments'], [])
+        self.assertEqual(volume.extra, {
+            'description': 'some description',
+            'attachments': [],
+            'state': 'available',
+            'location': 'nova',
+            'volume_type': 'None',
+            'metadata': {},
+            'created_at': '2013-06-21T12:39:02.000000',
+        })
 
     def test_list_sizes(self):
         sizes = self.driver.list_sizes()
@@ -890,6 +916,18 @@ class OpenStack_1_1_Tests(unittest.TestCase, TestCaseMixin):
         self.assertEqual(node.name, 'racktest')
         self.assertEqual(node.extra['disk_config'], 'AUTO')
 
+    def test_create_node_with_ex_config_drive(self):
+        OpenStack_1_1_MockHttp.type = 'EX_CONFIG_DRIVE'
+        image = NodeImage(
+            id=11, name='Ubuntu 8.10 (intrepid)', driver=self.driver)
+        size = NodeSize(
+            1, '256 slice', None, None, None, None, driver=self.driver)
+        node = self.driver.create_node(name='racktest', image=image, size=size,
+                                       ex_config_drive=True)
+        self.assertEqual(node.id, '26f7fbee-8ce1-4c28-887a-bfe8e4bb10fe')
+        self.assertEqual(node.name, 'racktest')
+        self.assertEqual(node.extra['config_drive'], True)
+
     def test_destroy_node(self):
         self.assertTrue(self.node.destroy())
 
@@ -897,7 +935,9 @@ class OpenStack_1_1_Tests(unittest.TestCase, TestCaseMixin):
         self.assertTrue(self.node.reboot())
 
     def test_create_volume(self):
-        self.assertEqual(self.driver.create_volume(1, 'test'), True)
+        volume = self.driver.create_volume(1, 'test')
+        self.assertEqual(volume.name, 'test')
+        self.assertEqual(volume.size, 1)
 
     def test_destroy_volume(self):
         volume = self.driver.ex_get_volume(
@@ -935,6 +975,16 @@ class OpenStack_1_1_Tests(unittest.TestCase, TestCaseMixin):
                     private_ips=None, driver=self.driver)
         success = self.driver.ex_rebuild(node, image=image,
                                          ex_disk_config='MANUAL')
+        self.assertTrue(success)
+
+    def test_ex_rebuild_with_ex_config_drive(self):
+        image = NodeImage(id=58, name='Ubuntu 10.10 (intrepid)',
+                          driver=self.driver)
+        node = Node(id=12066, name=None, state=None, public_ips=None,
+                    private_ips=None, driver=self.driver)
+        success = self.driver.ex_rebuild(node, image=image,
+                                         ex_disk_config='MANUAL',
+                                         ex_config_drive=True)
         self.assertTrue(success)
 
     def test_ex_resize(self):

@@ -335,6 +335,37 @@ INSTANCE_TYPES = {
         'ram': 244000,
         'disk': 320,  # x2
         'bandwidth': None
+    },
+    't2.micro': {
+        'id': 't2.micro',
+        'name': 'Burstable Performance Micro Instance',
+        'ram': 1024,
+        'disk': 0,  # EBS Only
+        'bandwidth': None,
+        'extra': {
+            'cpu': 1
+        }
+    },
+    # Burstable Performance General Purpose
+    't2.small': {
+        'id': 't2.small',
+        'name': 'Burstable Performance Small Instance',
+        'ram': 2048,
+        'disk': 0,  # EBS Only
+        'bandwidth': None,
+        'extra': {
+            'cpu': 11
+        }
+    },
+    't2.medium': {
+        'id': 't2.medium',
+        'name': 'Burstable Performance Medium Instance',
+        'ram': 4028,
+        'disk': 0,  # EBS Only
+        'bandwidth': None,
+        'extra': {
+            'cpu': 2
+        }
     }
 }
 
@@ -377,7 +408,10 @@ REGION_DETAILS = {
             'r3.xlarge',
             'r3.2xlarge',
             'r3.4xlarge',
-            'r3.8xlarge'
+            'r3.8xlarge',
+            't2.micro',
+            't2.small',
+            't2.medium'
         ]
     },
     # US West (Northern California) Region
@@ -453,7 +487,10 @@ REGION_DETAILS = {
             'r3.xlarge',
             'r3.2xlarge',
             'r3.4xlarge',
-            'r3.8xlarge'
+            'r3.8xlarge',
+            't2.micro',
+            't2.small',
+            't2.medium'
         ]
     },
     # EU (Ireland) Region
@@ -492,7 +529,10 @@ REGION_DETAILS = {
             'r3.xlarge',
             'r3.2xlarge',
             'r3.4xlarge',
-            'r3.8xlarge'
+            'r3.8xlarge',
+            't2.micro',
+            't2.small',
+            't2.medium'
         ]
     },
     # Asia Pacific (Singapore) Region
@@ -525,6 +565,9 @@ REGION_DETAILS = {
             'i2.2xlarge',
             'i2.4xlarge',
             'i2.8xlarge',
+            't2.micro',
+            't2.small',
+            't2.medium'
         ]
     },
     # Asia Pacific (Tokyo) Region
@@ -562,7 +605,10 @@ REGION_DETAILS = {
             'r3.xlarge',
             'r3.2xlarge',
             'r3.4xlarge',
-            'r3.8xlarge'
+            'r3.8xlarge',
+            't2.micro',
+            't2.small',
+            't2.medium'
         ]
     },
     # South America (Sao Paulo) Region
@@ -584,7 +630,10 @@ REGION_DETAILS = {
             'm3.xlarge',
             'm3.2xlarge',
             'c1.medium',
-            'c1.xlarge'
+            'c1.xlarge',
+            't2.micro',
+            't2.small',
+            't2.medium'
         ]
     },
     # Asia Pacific (Sydney) Region
@@ -621,7 +670,51 @@ REGION_DETAILS = {
             'r3.xlarge',
             'r3.2xlarge',
             'r3.4xlarge',
-            'r3.8xlarge'
+            'r3.8xlarge',
+            't2.micro',
+            't2.small',
+            't2.medium'
+        ]
+    },
+    'us-gov-west-1': {
+        'endpoint': 'ec2.us-gov-west-1.amazonaws.com',
+        'api_name': 'ec2_us_govwest',
+        'country': 'US',
+        'instance_types': [
+            't1.micro',
+            'm1.small',
+            'm1.medium',
+            'm1.large',
+            'm1.xlarge',
+            'm2.xlarge',
+            'm2.2xlarge',
+            'm2.4xlarge',
+            'm3.medium',
+            'm3.large',
+            'm3.xlarge',
+            'm3.2xlarge',
+            'c1.medium',
+            'c1.xlarge',
+            'g2.2xlarge',
+            'c3.large',
+            'c3.xlarge',
+            'c3.2xlarge',
+            'c3.4xlarge',
+            'c3.8xlarge',
+            'hs1.4xlarge',
+            'hs1.8xlarge',
+            'i2.xlarge',
+            'i2.2xlarge',
+            'i2.4xlarge',
+            'i2.8xlarge',
+            'r3.large',
+            'r3.xlarge',
+            'r3.2xlarge',
+            'r3.4xlarge',
+            'r3.8xlarge',
+            't2.micro',
+            't2.small',
+            't2.medium'
         ]
     },
     'nimbus': {
@@ -2187,7 +2280,7 @@ class BaseEC2NodeDriver(NodeDriver):
                      is io1.
         :type iops: ``int``
         """
-        valid_volume_types = ['standard', 'io1', 'g2']
+        valid_volume_types = ['standard', 'io1', 'gp2']
 
         params = {
             'Action': 'CreateVolume',
@@ -2480,7 +2573,7 @@ class BaseEC2NodeDriver(NodeDriver):
     def ex_register_image(self, name, description=None, architecture=None,
                           image_location=None, root_device_name=None,
                           block_device_mapping=None, kernel_id=None,
-                          ramdisk_id=None):
+                          ramdisk_id=None, virtualization_type=None):
         """
         Registers an Amazon Machine Image based off of an EBS-backed instance.
         Can also be used to create images from snapshots. More information
@@ -2515,6 +2608,11 @@ class BaseEC2NodeDriver(NodeDriver):
         :param      ramdisk_id: RAM disk for AMI (optional)
         :type       ramdisk_id: ``str``
 
+        :param      virtualization_type: The type of virtualization for the
+                                         AMI you are registering, paravirt
+                                         or hvm (optional)
+        :type       virtualization_type: ``str``
+
         :rtype:     :class:`NodeImage`
         """
 
@@ -2542,6 +2640,9 @@ class BaseEC2NodeDriver(NodeDriver):
 
         if ramdisk_id is not None:
             params['RamDiskId'] = ramdisk_id
+
+        if virtualization_type is not None:
+            params['VirtualizationType'] = virtualization_type
 
         image = self._to_image(
             self.connection.request(self.path, params=params).object
@@ -5285,7 +5386,7 @@ class EC2NodeDriver(BaseEC2NodeDriver):
         self.api_name = details['api_name']
         self.country = details['country']
 
-        self.connectionCls.host = details['endpoint']
+        host = host or details['endpoint']
 
         super(EC2NodeDriver, self).__init__(key=key, secret=secret,
                                             secure=secure, host=host,

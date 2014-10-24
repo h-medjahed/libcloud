@@ -19,13 +19,16 @@ import sys
 import unittest
 import datetime
 
+from mock import Mock
+
 from libcloud.utils.py3 import httplib
 from libcloud.compute.drivers.gce import (GCENodeDriver, API_VERSION,
                                           timestamp_to_datetime,
                                           GCEAddress, GCEHealthCheck,
                                           GCEFirewall, GCEForwardingRule,
                                           GCENetwork,
-                                          GCEZone)
+                                          GCEZone,
+                                          GCENodeImage)
 from libcloud.common.google import (GoogleBaseAuthConnection,
                                     GoogleInstalledAppAuthConnection,
                                     GoogleBaseConnection,
@@ -229,13 +232,23 @@ class GCENodeDriverTest(LibcloudTestCase, TestCaseMixin):
                   'interval': 10,
                   'timeout': 10,
                   'unhealthy_threshold': 4,
-                  'healthy_threshold': 3}
+                  'healthy_threshold': 3,
+                  'description': 'test healthcheck'}
         hc = self.driver.ex_create_healthcheck(healthcheck_name, **kwargs)
         self.assertTrue(isinstance(hc, GCEHealthCheck))
         self.assertEqual(hc.name, healthcheck_name)
         self.assertEqual(hc.path, '/lc')
         self.assertEqual(hc.port, 8000)
         self.assertEqual(hc.interval, 10)
+        self.assertEqual(hc.extra['host'], 'lchost')
+        self.assertEqual(hc.extra['description'], 'test healthcheck')
+
+    def test_ex_create_image(self):
+        volume = self.driver.ex_get_volume('lcdisk')
+        image = self.driver.ex_create_image('coreos', volume)
+        self.assertTrue(isinstance(image, GCENodeImage))
+        self.assertEqual(image.name, 'coreos')
+        self.assertEqual(image.extra['description'], 'CoreOS test image')
 
     def test_ex_create_firewall(self):
         firewall_name = 'lcfirewall'
@@ -250,11 +263,18 @@ class GCENodeDriverTest(LibcloudTestCase, TestCaseMixin):
         fwr_name = 'lcforwardingrule'
         targetpool = 'lctargetpool'
         region = 'us-central1'
+        port_range = '8000-8500'
+        description = 'test forwarding rule'
         fwr = self.driver.ex_create_forwarding_rule(fwr_name, targetpool,
                                                     region=region,
-                                                    port_range='8000-8500')
+                                                    port_range=port_range,
+                                                    description=description)
         self.assertTrue(isinstance(fwr, GCEForwardingRule))
         self.assertEqual(fwr.name, fwr_name)
+        self.assertEqual(fwr.region.name, region)
+        self.assertEqual(fwr.protocol, 'TCP')
+        self.assertEqual(fwr.extra['portRange'], port_range)
+        self.assertEqual(fwr.extra['description'], description)
 
     def test_ex_create_network(self):
         network_name = 'lcnetwork'
@@ -282,6 +302,11 @@ class GCENodeDriverTest(LibcloudTestCase, TestCaseMixin):
         self.assertEqual(node_data['tags']['items'][0], 'libcloud')
         self.assertEqual(node_data['name'], 'lcnode')
         self.assertTrue(node_data['disks'][0]['boot'])
+        self.assertIsInstance(node_data['serviceAccounts'], list)
+        self.assertIsInstance(node_data['serviceAccounts'][0], dict)
+        self.assertTrue(node_data['serviceAccounts'][0]['email'], 'default')
+        self.assertIsInstance(node_data['serviceAccounts'][0]['scopes'], list)
+        self.assertTrue(len(node_data['serviceAccounts'][0]['scopes']), 1)
 
     def test_create_node(self):
         node_name = 'node-name'
@@ -290,6 +315,55 @@ class GCENodeDriverTest(LibcloudTestCase, TestCaseMixin):
         node = self.driver.create_node(node_name, size, image)
         self.assertTrue(isinstance(node, Node))
         self.assertEqual(node.name, node_name)
+
+    def test_create_node_req_with_serviceaccounts(self):
+        image = self.driver.ex_get_image('debian-7')
+        size = self.driver.ex_get_size('n1-standard-1')
+        location = self.driver.zone
+        network = self.driver.ex_get_network('default')
+        # ex_service_accounts with specific scopes, default 'email'
+        ex_sa = [{'scopes': ['compute-ro', 'pubsub', 'storage-ro']}]
+        node_request, node_data = self.driver._create_node_req('lcnode', size,
+                                                               image, location,
+                                                               network,
+                                                               ex_service_accounts=ex_sa)
+        self.assertIsInstance(node_data['serviceAccounts'], list)
+        self.assertIsInstance(node_data['serviceAccounts'][0], dict)
+        self.assertTrue(node_data['serviceAccounts'][0]['email'], 'default')
+        self.assertIsInstance(node_data['serviceAccounts'][0]['scopes'], list)
+        self.assertTrue(len(node_data['serviceAccounts'][0]['scopes']), 3)
+        self.assertTrue('https://www.googleapis.com/auth/devstorage.read_only'
+                        in node_data['serviceAccounts'][0]['scopes'])
+        self.assertTrue('https://www.googleapis.com/auth/compute.readonly'
+                        in node_data['serviceAccounts'][0]['scopes'])
+
+    def test_create_node_with_metadata(self):
+        node_name = 'node-name'
+        image = self.driver.ex_get_image('debian-7')
+        size = self.driver.ex_get_size('n1-standard-1')
+
+        self.driver._create_node_req = Mock()
+        self.driver._create_node_req.return_value = (None, None)
+        self.driver.connection.async_request = Mock()
+        self.driver.ex_get_node = Mock()
+
+        # ex_metadata doesn't contain "items" key
+        ex_metadata = {'key1': 'value1', 'key2': 'value2'}
+        self.driver.create_node(node_name, size, image,
+                                ex_metadata=ex_metadata)
+
+        actual = self.driver._create_node_req.call_args[0][6]
+        self.assertTrue('items' in actual)
+        self.assertEqual(len(actual['items']), 2)
+
+        # ex_metadata contains "items" key
+        ex_metadata = {'items': [{'key0': 'value0'}]}
+        self.driver.create_node(node_name, size, image,
+                                ex_metadata=ex_metadata)
+        actual = self.driver._create_node_req.call_args[0][6]
+        self.assertTrue('items' in actual)
+        self.assertEqual(len(actual['items']), 1)
+        self.assertEqual(actual['items'][0], {'key0': 'value0'})
 
     def test_create_node_existing(self):
         node_name = 'libcloud-demo-europe-np-node'
@@ -383,7 +457,20 @@ class GCENodeDriverTest(LibcloudTestCase, TestCaseMixin):
         self.assertTrue(remove_node)
         self.assertEqual(len(targetpool.nodes), 1)
 
+        add_node = self.driver.ex_targetpool_add_node(targetpool, node.extra['selfLink'])
+        self.assertTrue(add_node)
+        self.assertEqual(len(targetpool.nodes), 2)
+
+        remove_node = self.driver.ex_targetpool_remove_node(targetpool, node.extra['selfLink'])
+        self.assertTrue(remove_node)
+        self.assertEqual(len(targetpool.nodes), 1)
+
         add_node = self.driver.ex_targetpool_add_node(targetpool, node)
+        self.assertTrue(add_node)
+        self.assertEqual(len(targetpool.nodes), 2)
+
+        # check that duplicates are filtered
+        add_node = self.driver.ex_targetpool_add_node(targetpool, node.extra['selfLink'])
         self.assertTrue(add_node)
         self.assertEqual(len(targetpool.nodes), 2)
 

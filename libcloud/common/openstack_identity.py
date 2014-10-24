@@ -83,6 +83,15 @@ class OpenStackIdentityEndpointType(object):
     ADMIN = 'admin'
 
 
+class OpenStackIdentityTokenScope(object):
+    """
+    Enum class for openstack identity token scope.
+    """
+    PROJECT = 'project'
+    DOMAIN = 'domain'
+    UNSCOPED = 'unscoped'
+
+
 class OpenStackIdentityVersion(object):
     def __init__(self, version, status, updated, url):
         self.version = version
@@ -92,7 +101,7 @@ class OpenStackIdentityVersion(object):
 
     def __repr__(self):
         return (('<OpenStackIdentityVersion version=%s, status=%s, '
-                 'updated=%s, url=%s' %
+                 'updated=%s, url=%s>' %
                  (self.version, self.status, self.updated, self.url)))
 
 
@@ -108,12 +117,12 @@ class OpenStackIdentityDomain(object):
 
 
 class OpenStackIdentityProject(object):
-    def __init__(self, id, domain_id, name, description, enabled):
+    def __init__(self, id, name, description, enabled, domain_id=None):
         self.id = id
-        self.domain_id = domain_id
         self.name = name
         self.description = description
         self.enabled = enabled
+        self.domain_id = domain_id
 
     def __repr__(self):
         return (('<OpenStackIdentityProject id=%s, domain_id=%s, name=%s, '
@@ -145,8 +154,8 @@ class OpenStackIdentityUser(object):
 
     def __repr__(self):
         return (('<OpenStackIdentityUser id=%s, domain_id=%s, name=%s, '
-                 'email=%s, enabled=%s' % (self.id, self.domain_id, self.name,
-                                           self.email, self.enabled)))
+                 'email=%s, enabled=%s>' % (self.id, self.domain_id, self.name,
+                                            self.email, self.enabled)))
 
 
 class OpenStackServiceCatalog(object):
@@ -699,6 +708,23 @@ class OpenStackIdentityConnection(ConnectionUserAndKey):
 
         return True
 
+    def _to_projects(self, data):
+        result = []
+        for item in data:
+            project = self._to_project(data=item)
+            result.append(project)
+
+        return result
+
+    def _to_project(self, data):
+        project = OpenStackIdentityProject(id=data['id'],
+                                           name=data['name'],
+                                           description=data['description'],
+                                           enabled=data['enabled'],
+                                           domain_id=data.get('domain_id',
+                                                              None))
+        return project
+
 
 class OpenStackIdentity_1_0_Connection(OpenStackIdentityConnection):
     """
@@ -869,6 +895,14 @@ class OpenStackIdentity_2_0_Connection(OpenStackIdentityConnection):
 
         return self
 
+    def list_projects(self):
+        response = self.authenticated_request('/v2.0/tenants', method='GET')
+        result = self._to_projects(data=response.object['tenants'])
+        return result
+
+    def list_tenants(self):
+        return self.list_projects()
+
 
 class OpenStackIdentity_3_0_Connection(OpenStackIdentityConnection):
     """
@@ -879,8 +913,31 @@ class OpenStackIdentity_3_0_Connection(OpenStackIdentityConnection):
     name = 'OpenStack Identity API v3.x'
     auth_version = '3.0'
 
-    def __init__(self, auth_url, user_id, key, tenant_name=None, timeout=None,
-                 parent_conn=None):
+    VALID_TOKEN_SCOPES = [
+        OpenStackIdentityTokenScope.PROJECT,
+        OpenStackIdentityTokenScope.DOMAIN,
+        OpenStackIdentityTokenScope.UNSCOPED
+    ]
+
+    def __init__(self, auth_url, user_id, key, tenant_name=None,
+                 domain_name='Default',
+                 token_scope=OpenStackIdentityTokenScope.PROJECT,
+                 timeout=None, parent_conn=None):
+        """
+        :param tenant_name: Name of the project this user belongs to. Note:
+                            When token_scope is set to project, this argument
+                            control to which project to scope the token to.
+        :type tenant_name: ``str``
+
+        :param domain_name: Domain the user belongs to. Note: Then token_scope
+                            is set to token, this argument controls to which
+                            domain to scope the token to.
+        :type domain_name: ``str``
+
+        :param token_scope: Whether to scope a token to a "project" or a
+                         "domain"
+        :type token_scope: ``str``
+        """
         super(OpenStackIdentity_3_0_Connection,
               self).__init__(auth_url=auth_url,
                              user_id=user_id,
@@ -888,6 +945,21 @@ class OpenStackIdentity_3_0_Connection(OpenStackIdentityConnection):
                              tenant_name=tenant_name,
                              timeout=timeout,
                              parent_conn=parent_conn)
+        if token_scope not in self.VALID_TOKEN_SCOPES:
+            raise ValueError('Invalid value for "token_scope" argument: %s' %
+                             (token_scope))
+
+        if (token_scope == OpenStackIdentityTokenScope.PROJECT and
+                (not tenant_name or not domain_name)):
+            raise ValueError('Must provide tenant_name and domain_name '
+                             'argument')
+        elif (token_scope == OpenStackIdentityTokenScope.DOMAIN and
+                not domain_name):
+            raise ValueError('Must provide domain_name argument')
+
+        self.tenant_name = tenant_name
+        self.domain_name = domain_name
+        self.token_scope = token_scope
         self.auth_user_roles = None
 
     def authenticate(self, force=False):
@@ -897,9 +969,6 @@ class OpenStackIdentity_3_0_Connection(OpenStackIdentityConnection):
         if not self._is_authentication_needed(force=force):
             return self
 
-        # TODO: Support for custom domain
-        domain = 'Default'
-
         data = {
             'auth': {
                 'identity': {
@@ -907,33 +976,38 @@ class OpenStackIdentity_3_0_Connection(OpenStackIdentityConnection):
                     'password': {
                         'user': {
                             'domain': {
-                                'name': domain
+                                'name': self.domain_name
                             },
                             'name': self.user_id,
                             'password': self.key
                         }
                     }
-                },
-                'scope': {
-                    'project': {
-                        'domain': {
-                            'name': domain
-                        },
-                        'name': self.tenant_name
-                    }
                 }
             }
         }
 
-        if self.tenant_name:
+        if self.token_scope == OpenStackIdentityTokenScope.PROJECT:
+            # Scope token to project (tenant)
             data['auth']['scope'] = {
                 'project': {
                     'domain': {
-                        'name': domain
+                        'name': self.domain_name
                     },
                     'name': self.tenant_name
                 }
             }
+        elif self.token_scope == OpenStackIdentityTokenScope.DOMAIN:
+            # Scope token to domain
+            data['auth']['scope'] = {
+                'domain': {
+                    'name': self.domain_name
+                }
+            }
+        elif self.token_scope == OpenStackIdentityTokenScope.UNSCOPED:
+            pass
+        else:
+            raise ValueError('Token needs to be scoped either to project or '
+                             'a domain')
 
         data = json.dumps(data)
         response = self.request('/v3/auth/tokens', data=data,
@@ -963,7 +1037,8 @@ class OpenStackIdentity_3_0_Connection(OpenStackIdentityConnection):
 
                 self.auth_token = headers['x-subject-token']
                 self.auth_token_expires = parse_date(expires)
-                self.urls = body['token']['catalog']
+                # Note: catalog is not returned for unscoped tokens
+                self.urls = body['token'].get('catalog', None)
                 self.auth_user_info = None
                 self.auth_user_roles = roles
             except KeyError:
@@ -1058,11 +1133,14 @@ class OpenStackIdentity_3_0_Connection(OpenStackIdentityConnection):
         result = self._to_roles(data=response.object['roles'])
         return result
 
-    def grant_role_to_user(self, domain, role, user):
+    def grant_domain_role_to_user(self, domain, role, user):
         """
-        Grant role to the domain user.
+        Grant domain role to a user.
 
-        Note: This function appeats to be idempodent.
+        Note: This function appears to be idempodent.
+
+        :param domain: Domain to grant the role to.
+        :type domain: :class:`.OpenStackIdentityDomain`
 
         :param role: Role to grant.
         :type role: :class:`.OpenStackIdentityRole`
@@ -1078,20 +1156,73 @@ class OpenStackIdentity_3_0_Connection(OpenStackIdentityConnection):
         response = self.authenticated_request(path, method='PUT')
         return response.status == httplib.NO_CONTENT
 
-    def revoke_role_from_user(self, domain, user, role):
+    def revoke_domain_role_from_user(self, domain, user, role):
         """
-        Revoke role from a domain user.
+        Revoke domain role from a user.
+
+        :param domain: Domain to revoke the role from.
+        :type domain: :class:`.OpenStackIdentityDomain`
+
+        :param role: Role to revoke.
+        :type role: :class:`.OpenStackIdentityRole`
+
+        :param user: User to revoke the role from.
+        :type user: :class:`.OpenStackIdentityUser`
+
+        :return: ``True`` on success.
+        :rtype: ``bool``
         """
         path = ('/v3/domains/%s/users/%s/roles/%s' %
                 (domain.id, user.id, role.id))
         response = self.authenticated_request(path, method='DELETE')
         return response.status == httplib.NO_CONTENT
 
-    def create_domain(self):
-        pass
+    def grant_project_role_to_user(self, project, role, user):
+        """
+        Grant project role to a user.
+
+        Note: This function appeats to be idempodent.
+
+        :param project: Project to grant the role to.
+        :type project: :class:`.OpenStackIdentityDomain`
+
+        :param role: Role to grant.
+        :type role: :class:`.OpenStackIdentityRole`
+
+        :param user: User to grant the role to.
+        :type user: :class:`.OpenStackIdentityUser`
+
+        :return: ``True`` on success.
+        :rtype: ``bool``
+        """
+        path = ('/v3/projects/%s/users/%s/roles/%s' %
+                (project.id, user.id, role.id))
+        response = self.authenticated_request(path, method='PUT')
+        return response.status == httplib.NO_CONTENT
+
+    def revoke_project_role_from_user(self, project, role, user):
+        """
+        Revoke project role from a user.
+
+        :param project: Project to revoke the role from.
+        :type project: :class:`.OpenStackIdentityDomain`
+
+        :param role: Role to revoke.
+        :type role: :class:`.OpenStackIdentityRole`
+
+        :param user: User to revoke the role from.
+        :type user: :class:`.OpenStackIdentityUser`
+
+        :return: ``True`` on success.
+        :rtype: ``bool``
+        """
+        path = ('/v3/projects/%s/users/%s/roles/%s' %
+                (project.id, user.id, role.id))
+        response = self.authenticated_request(path, method='DELETE')
+        return response.status == httplib.NO_CONTENT
 
     def create_user(self, email, password, name, description=None,
-                    domain_id=None, enabled=True):
+                    domain_id=None, default_project_id=None, enabled=True):
         """
         Create a new user account.
 
@@ -1109,6 +1240,9 @@ class OpenStackIdentity_3_0_Connection(OpenStackIdentityConnection):
 
         :param domain_id: ID of the domain to add the user to (optional).
         :type domain_id: ``str``
+
+        :param default_project_id: ID of the default user project (optional).
+        :type default_project_id: ``str``
 
         :param enabled: True to enable user after creation.
         :type enabled: ``bool``
@@ -1129,9 +1263,58 @@ class OpenStackIdentity_3_0_Connection(OpenStackIdentityConnection):
         if domain_id:
             data['domain_id'] = domain_id
 
+        if default_project_id:
+            data['default_project_id'] = default_project_id
+
         data = json.dumps({'user': data})
         response = self.authenticated_request('/v3/users', data=data,
                                               method='POST')
+
+        user = self._to_user(data=response.object['user'])
+        return user
+
+    def enable_user(self, user):
+        """
+        Enable user account.
+
+        Note: This operation appears to be idempotent.
+
+        :param user: User to enable.
+        :type user: :class:`.OpenStackIdentityUser`
+
+        :return: User account which has been enabled.
+        :rtype: :class:`.OpenStackIdentityUser`
+        """
+        data = {
+            'enabled': True
+        }
+        data = json.dumps({'user': data})
+        response = self.authenticated_request('/v3/users/%s' % (user.id),
+                                              data=data,
+                                              method='PATCH')
+
+        user = self._to_user(data=response.object['user'])
+        return user
+
+    def disable_user(self, user):
+        """
+        Disable user account.
+
+        Note: This operation appears to be idempotent.
+
+        :param user: User to disable.
+        :type user: :class:`.OpenStackIdentityUser`
+
+        :return: User account which has been disabled.
+        :rtype: :class:`.OpenStackIdentityUser`
+        """
+        data = {
+            'enabled': False
+        }
+        data = json.dumps({'user': data})
+        response = self.authenticated_request('/v3/users/%s' % (user.id),
+                                              data=data,
+                                              method='PATCH')
 
         user = self._to_user(data=response.object['user'])
         return user
@@ -1149,22 +1332,6 @@ class OpenStackIdentity_3_0_Connection(OpenStackIdentityConnection):
                                          name=data['name'],
                                          enabled=data['enabled'])
         return domain
-
-    def _to_projects(self, data):
-        result = []
-        for item in data:
-            project = self._to_project(data=item)
-            result.append(project)
-
-        return result
-
-    def _to_project(self, data):
-        project = OpenStackIdentityProject(id=data['id'],
-                                           domain_id=data['domain_id'],
-                                           name=data['name'],
-                                           description=data['description'],
-                                           enabled=data['enabled'])
-        return project
 
     def _to_users(self, data):
         result = []

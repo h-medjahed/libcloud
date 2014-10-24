@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import sys
-import unittest
 import datetime
 
 try:
@@ -26,13 +25,15 @@ from mock import Mock
 
 from libcloud.utils.py3 import httplib
 from libcloud.common.openstack import OpenStackBaseConnection
-from libcloud.common.openstack import AUTH_TOKEN_EXPIRES_GRACE_SECONDS
+from libcloud.common.openstack_identity import AUTH_TOKEN_EXPIRES_GRACE_SECONDS
 from libcloud.common.openstack_identity import get_class_for_auth_version
-from libcloud.common.openstack_identity import OpenStackIdentity_2_0_Connection
 from libcloud.common.openstack_identity import OpenStackServiceCatalog
+from libcloud.common.openstack_identity import OpenStackIdentity_2_0_Connection
 from libcloud.common.openstack_identity import OpenStackIdentity_3_0_Connection
+from libcloud.common.openstack_identity import OpenStackIdentityUser
 from libcloud.compute.drivers.openstack import OpenStack_1_0_NodeDriver
 
+from libcloud.test import unittest
 from libcloud.test import MockHttp
 from libcloud.test.secrets import OPENSTACK_PARAMS
 from libcloud.test.file_fixtures import ComputeFileFixtures
@@ -221,6 +222,27 @@ class OpenStackIdentityConnectionTestCase(unittest.TestCase):
         return connection
 
 
+class OpenStackIdentity_2_0_ConnectionTests(unittest.TestCase):
+    def setUp(self):
+        mock_cls = OpenStackIdentity_2_0_MockHttp
+        mock_cls.type = None
+        OpenStackIdentity_2_0_Connection.conn_classes = (mock_cls, mock_cls)
+
+        self.auth_instance = OpenStackIdentity_2_0_Connection(auth_url='http://none',
+                                                              user_id='test',
+                                                              key='test',
+                                                              tenant_name='test')
+        self.auth_instance.auth_token = 'mock'
+
+    def test_list_projects(self):
+        result = self.auth_instance.list_projects()
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0].id, 'a')
+        self.assertEqual(result[0].name, 'test')
+        self.assertEqual(result[0].description, 'test project')
+        self.assertTrue(result[0].enabled)
+
+
 class OpenStackIdentity_3_0_ConnectionTests(unittest.TestCase):
     def setUp(self):
         mock_cls = OpenStackIdentity_3_0_MockHttp
@@ -229,8 +251,53 @@ class OpenStackIdentity_3_0_ConnectionTests(unittest.TestCase):
 
         self.auth_instance = OpenStackIdentity_3_0_Connection(auth_url='http://none',
                                                               user_id='test',
-                                                              key='test')
+                                                              key='test',
+                                                              tenant_name='test')
         self.auth_instance.auth_token = 'mock'
+
+    def test_token_scope_argument(self):
+        # Invalid token_scope value
+        expected_msg = 'Invalid value for "token_scope" argument: foo'
+        self.assertRaisesRegexp(ValueError, expected_msg,
+                                OpenStackIdentity_3_0_Connection,
+                                auth_url='http://none',
+                                user_id='test',
+                                key='test',
+                                token_scope='foo')
+
+        # Missing tenant_name
+        expected_msg = 'Must provide tenant_name and domain_name argument'
+        self.assertRaisesRegexp(ValueError, expected_msg,
+                                OpenStackIdentity_3_0_Connection,
+                                auth_url='http://none',
+                                user_id='test',
+                                key='test',
+                                token_scope='project')
+
+        # Missing domain_name
+        expected_msg = 'Must provide domain_name argument'
+        self.assertRaisesRegexp(ValueError, expected_msg,
+                                OpenStackIdentity_3_0_Connection,
+                                auth_url='http://none',
+                                user_id='test',
+                                key='test',
+                                token_scope='domain',
+                                domain_name=None)
+
+        # Scope to project all ok
+        OpenStackIdentity_3_0_Connection(auth_url='http://none',
+                                         user_id='test',
+                                         key='test',
+                                         token_scope='project',
+                                         tenant_name='test',
+                                         domain_name='Default')
+        # Scope to domain
+        OpenStackIdentity_3_0_Connection(auth_url='http://none',
+                                         user_id='test',
+                                         key='test',
+                                         token_scope='domain',
+                                         tenant_name=None,
+                                         domain_name='Default')
 
     def test_list_supported_versions(self):
         OpenStackIdentity_3_0_MockHttp.type = 'v3'
@@ -297,24 +364,54 @@ class OpenStackIdentity_3_0_ConnectionTests(unittest.TestCase):
         self.assertEqual(user.id, 'c')
         self.assertEqual(user.name, 'test2')
 
-    def test_grant_role_to_user(self):
+    def test_enable_user(self):
+        user = self.auth_instance.list_users()[0]
+        result = self.auth_instance.enable_user(user=user)
+        self.assertTrue(isinstance(result, OpenStackIdentityUser))
+
+    def test_disable_user(self):
+        user = self.auth_instance.list_users()[0]
+        result = self.auth_instance.disable_user(user=user)
+        self.assertTrue(isinstance(result, OpenStackIdentityUser))
+
+    def test_grant_domain_role_to_user(self):
         domain = self.auth_instance.list_domains()[0]
         role = self.auth_instance.list_roles()[0]
         user = self.auth_instance.list_users()[0]
 
-        result = self.auth_instance.grant_role_to_user(domain=domain,
-                                                       role=role,
-                                                       user=user)
+        result = self.auth_instance.grant_domain_role_to_user(domain=domain,
+                                                              role=role,
+                                                              user=user)
         self.assertTrue(result)
 
-    def test_revoke_role_from_user(self):
+    def test_revoke_domain_role_from_user(self):
         domain = self.auth_instance.list_domains()[0]
         role = self.auth_instance.list_roles()[0]
         user = self.auth_instance.list_users()[0]
 
-        result = self.auth_instance.revoke_role_from_user(domain=domain,
-                                                          role=role,
-                                                          user=user)
+        result = self.auth_instance.revoke_domain_role_from_user(domain=domain,
+                                                                 role=role,
+                                                                 user=user)
+        self.assertTrue(result)
+
+    def test_grant_project_role_to_user(self):
+        project = self.auth_instance.list_projects()[0]
+        role = self.auth_instance.list_roles()[0]
+        user = self.auth_instance.list_users()[0]
+
+        result = self.auth_instance.grant_project_role_to_user(project=project,
+                                                               role=role,
+                                                               user=user)
+        self.assertTrue(result)
+
+    def test_revoke_project_role_from_user(self):
+        project = self.auth_instance.list_projects()[0]
+        role = self.auth_instance.list_roles()[0]
+        user = self.auth_instance.list_users()[0]
+
+        result = self.auth_instance.revoke_project_role_from_user(project=project,
+                                                                  role=role,
+                                                                  user=user)
         self.assertTrue(result)
 
 
@@ -444,8 +541,19 @@ class OpenStackServiceCatalogTestCase(unittest.TestCase):
                                          'nova'])
 
 
+class OpenStackIdentity_2_0_MockHttp(MockHttp):
+    fixtures = ComputeFileFixtures('openstack_identity/v2')
+    json_content_headers = {'content-type': 'application/json; charset=UTF-8'}
+
+    def _v2_0_tenants(self, method, url, body, headers):
+        if method == 'GET':
+            body = self.fixtures.load('v2_0_tenants.json')
+            return (httplib.OK, body, self.json_content_headers, httplib.responses[httplib.OK])
+        raise NotImplementedError()
+
+
 class OpenStackIdentity_3_0_MockHttp(MockHttp):
-    fixtures = ComputeFileFixtures('openstack_identity')
+    fixtures = ComputeFileFixtures('openstack_identity/v3')
     json_content_headers = {'content-type': 'application/json; charset=UTF-8'}
 
     def _v3(self, method, url, body, headers):
@@ -478,6 +586,13 @@ class OpenStackIdentity_3_0_MockHttp(MockHttp):
                     httplib.responses[httplib.CREATED])
         raise NotImplementedError()
 
+    def _v3_users_a(self, method, url, body, headers):
+        if method == 'PATCH':
+            # enable / disable user
+            body = self.fixtures.load('v3_users_a.json')
+            return (httplib.OK, body, self.json_content_headers, httplib.responses[httplib.OK])
+        raise NotImplementedError()
+
     def _v3_roles(self, method, url, body, headers):
         if method == 'GET':
             body = self.fixtures.load('v3_roles.json')
@@ -486,12 +601,25 @@ class OpenStackIdentity_3_0_MockHttp(MockHttp):
 
     def _v3_domains_default_users_a_roles_a(self, method, url, body, headers):
         if method == 'PUT':
-            # grant role
+            # grant domain role
             body = ''
             return (httplib.NO_CONTENT, body, self.json_content_headers,
                     httplib.responses[httplib.NO_CONTENT])
         elif method == 'DELETE':
-            # revoke role
+            # revoke domain role
+            body = ''
+            return (httplib.NO_CONTENT, body, self.json_content_headers,
+                    httplib.responses[httplib.NO_CONTENT])
+        raise NotImplementedError()
+
+    def _v3_projects_a_users_a_roles_a(self, method, url, body, headers):
+        if method == 'PUT':
+            # grant project role
+            body = ''
+            return (httplib.NO_CONTENT, body, self.json_content_headers,
+                    httplib.responses[httplib.NO_CONTENT])
+        elif method == 'DELETE':
+            # revoke project role
             body = ''
             return (httplib.NO_CONTENT, body, self.json_content_headers,
                     httplib.responses[httplib.NO_CONTENT])
